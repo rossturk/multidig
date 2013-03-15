@@ -1,0 +1,540 @@
+#!/usr/bin/perl
+
+#
+#  Program:	multidig - multi-server domain internet groper
+#  Usage:	multidig host [ options ] [ -- +server|serverlist ... ]
+#
+#  Description:	The multidig program was created in order to verify
+#  		consistant resolution across a network of DNS servers.
+#  		Essentially, it resolves the given host on each server
+#  		in the server list, and compares results.
+#
+#  Version:	0.93
+#  Author:	Ross David Turk <rdt@sf.net>
+#		Sun Jun 11 22:04:16 CDT 2000
+#
+#  This software was written under the General Public License.  See the
+#  GPL file for specifics.
+#
+
+use Getopt::Long;
+use Net::DNS;
+
+# don't buffer my output!
+$| =			1;
+
+# these are my global variables
+%srv =			();
+%config =		();
+@uniqueresults =	();
+@nameservers =		();
+
+# do all our setup
+parse_config();
+parse_arguments();
+create_server_list();
+
+# if debug is on, print everything out before doing anything else
+if ($config{"debug"}) {
+
+	print "query string: | $string |\n";
+
+	while (($key,$value) = each(%config)) {
+		print "$key: | $value |\n";
+	}
+
+	print "nameserver list: | @nameservers |\n";
+}
+
+# fullyqualify will add the default_domain if always_fq is turned on.
+# better to have the always_fq check in one place in the code and have
+# it exec a few extra cycles even if it's not on.  let's get real, it's
+# in perl..it's not going to be very efficient, so it might as well
+# be tight code.
+fullyqualify(\$string);
+
+$res =		new Net::DNS::Resolver;
+
+$res->recurse($config{"recurse"});
+$res->tcp_timeout(3);
+$res->udp_timeout(3);
+
+# Data model for unique server responses:
+#
+# uniqueresults (list) (
+# 	dataset (hash) (
+# 		key "ns" -> array (
+# 			nameserver
+# 			...
+# 		)
+#		key "rr" -> array (
+#			rr (hash) (
+# 				"name"	-> fqdn
+# 				"class"	-> usually IN
+# 				"type"	-> RR type
+# 				"data"	-> data field
+# 				"ttl"	-> record ttl (optional)
+# 			)
+# 			...
+# 		)
+# )
+
+NS: foreach $nameserver (@nameservers) {
+
+	fullyqualify(\$nameserver);
+
+	$res->nameservers($nameserver);
+
+	$query =		$res->send($string,"ANY", "IN");
+
+	unless ($query) {
+		print "query of $nameserver failed: ", $res->errorstring, "\n";
+		next NS;
+	}
+
+	my (%dataset) =		();
+	my (@rr) =		();
+	my (@ns) =		();
+
+	# get the header to find out auth information, and possibly other
+	# stuff in the future..
+	$header =		$query->header;
+	$auth =			$header->aa ? "          " : "(non-auth)";
+
+	foreach $answer_rr ($query->answer) {
+
+		# each resource record is a hash.  it was designed this way so that
+		# the comparison of resource record sets could be written as a simple
+		# comparison between two hashes.  that way, if we want to consider
+		# ttls, we put them in the hash.  if we don't, we don't.  it's also
+		# better than making strings out of them..
+		my (%record) =		();
+
+		$record{"name"} =	$answer_rr->name;
+		$record{"class"} =	$answer_rr->class;
+		$record{"type"} =	$answer_rr->type;
+		$record{"data"} =	$answer_rr->rdatastr;
+		$record{"auth"} =	$auth;
+
+		if ($config{"compare_ttl"}) {
+			$record{"ttl"} =	$answer_rr->ttl;
+		}
+
+
+		# if it's the SOA, we want to make it all fit on one line and strip out
+		# the comments.  any dns admin worth his salt should know the order
+		# anyway..
+		if ($record{"type"} =~ m/soa/i) {
+
+			@soa =		split(/\n/, $record{"data"});
+
+			$record{"data"} =		"";
+
+			foreach $section (@soa) {
+				$section =~	s/(.*)\;.*/$1/g;
+				$record{"data"} .=	$section . " ";
+			}
+
+			$record{"data"} =~	s/[\(\)]//g;
+
+		}
+
+		# no spaces in the FQDN
+		$record{"name"} =~	s/\s+//g;
+
+		# no multiple spaces or leading and trailing spaces in the data
+		$record{"data"} =~	s/\s+/ /g;
+		$record{"data"} =~	s/(^\s+|\s+$)//g;
+
+		# unless we're comparing cases, make everything lower.
+		unless ($config{"compare_case"}) {
+			$record{"data"} =~	tr/A-Z/a-z/;
+			$record{"name"} =~	tr/A-Z/a-z/;
+		}
+
+		# and add the RR reference to our set.
+		push (@rr, \%record);
+
+	}
+
+	# one dot per server - for those long resolution sessions
+	print ".";
+
+	# here we cycle through our list of unique record sets, which will
+	# be blank if this is the first server on the list
+	foreach $uniquedataset (@uniqueresults) {
+
+		$uniquerrset = $$uniquedataset{"rr"};
+
+		# compare this server's recordset to the unique list of sets, and
+		# if it matches, add this server's name to the "ns" list of the
+		# record set it matches.  then skip directly to the next server
+		# in the list.  eww.."next".  wouldn't expect to see that here,
+		# but I'm not sure whether it's worth finding a better way.
+		if (comparerrset($uniquerrset, \@rr)) {
+			$uniquensset = $$uniquedataset{"ns"};
+			push (@$uniquensset, $nameserver);
+			next NS;
+		}
+	
+	}
+
+	# we've figured out that this is either the first server in the list,
+	# or it has a recordset different from all the others.
+	push (@ns, $nameserver);
+
+	$dataset{"rr"} =	\@rr;
+	$dataset{"ns"} =	\@ns;
+
+	push (@uniqueresults, \%dataset);
+
+}
+
+print "\n\n";
+
+# for each recordset in the list of unique recordsets, print it, labelling it
+# with the appropriate server list
+foreach $dataset (@uniqueresults) {
+	$nsset = $$dataset{"ns"};
+
+	$nameserver = join(', ', @$nsset);
+
+	print "$nameserver:\n";
+
+	$rrset = $$dataset{"rr"};
+
+	if (@$rrset == 0) {
+		print "           Nothing\n";
+	}
+
+	foreach $rr (@$rrset) {
+		print rrstr($rr);
+	}
+
+	print "\n";
+}
+
+print "--\n";
+
+# load and parse the configuration file, creating it if it does not exist
+sub parse_config() {
+
+	# This probably shouldn't ever have to change, so I don't mind hardcoding
+	# it and hiding it way deep in the code where nobody will find it.
+	$profile = 		$ENV{"HOME"} . "/.multidigrc";
+
+	unless (open(PROFILE, $profile)) {
+
+		# Can't open the profile.  Assume it doesn't exist and try to create
+		# it.
+		unless (open(NEWPROFILE, ">$profile")) {
+			print "Can't write to $profile.\n";
+			exit 1;
+		}
+
+		print "Creating $profile.  You should edit it.\n\n";
+		print NEWPROFILE <<"EOF";
+# 
+# Configuration parameters:
+# -------------------------
+#
+# Configration parameters are in the format "key = value".
+#
+
+# Parameter:	compare_ttl
+# Value:	1/0 
+#
+# Do we want to consider the record's TTLs in our comparison?
+#
+
+compare_ttl =	0
+
+# Parameter:	compare_case
+# Value:	1/0 
+#
+# Do we want to be case sensitive in our comparison?
+#
+
+compare_case =	0
+
+# Parameter:	recurse
+# Value:	1/0
+#
+# Do we want to query in recursive mode?
+#
+
+recurse =	0
+
+# Parameter:	always_fq
+# Value:	1/0
+#
+# Do we fully qualify all hostnames that don't end with a dot (or aren't in
+# dotted quad notation?)
+#
+
+always_fq =	0
+
+# Parameter:	domain_fq
+# Value:	domain name, without leading or trailing dot
+#
+# The domain we use to fully qualify domains if always_fq is in use
+#
+
+domain_fq =	frivolity.net
+
+# Parameter:	default_list
+# Value:	list name from below or "none"
+#
+# The list we use by default.  If this is none, the list must be built on the
+# command line.
+#
+
+default_list =	home
+
+# 
+# Server lists:
+# -------------
+#
+# Server lists are in the format "name = { server server ... }".
+# 
+# The list named "default" will be used when there is no other list
+# specified on the command line.
+#
+# Lists can contain IP addresses or hostnames.  If the hostnames don't
+# end with a dot and always_fq is in use, the value of domain_fq will be
+# appended.
+#
+
+home =		{ 209.197.231.30 192.168.1.50 }
+roots =		{ a.root-servers.net. b.root-servers.net. c.root-servers.net. }
+myserverlist =	{ ns1 ns2 }
+
+
+EOF
+
+		# close it for writing and open it for reading, so that
+		# life outside this loop can continue normally.  I know it's
+		# weird to parse a file right after we write it, but I'm
+		# assuming this is a once-in-a-lifetime sort of thing, and 
+		# I'm going to respect the consistancy of my code over the
+		# performance concerns of something like this...
+	
+		close NEWPROFILE;
+		open(PROFILE, $profile);
+	}
+
+	while ($line = <PROFILE>) {
+
+		# Zap comments
+		$line =~		s/(.*)#.*/$1/;
+
+		# If it's nothing but comments or just a blank line skip it
+		$line =~		m/^\s*$/ && next;
+
+		my($key, $val) =	split (/=/, $line);
+
+		# leading and trailing spaces
+		$key =~			s/(^\s+|\s+$)//g;
+		$val =~			s/(^\s+|\s+$)//g;
+
+		# If it's in a list (i.e., in {}s), rip it out and schlep
+		# it in the global %srv array
+		if ($val =~ m/{\s*(.*)\s*}/) {
+			my(@list) =	split (/\s+/, $1);
+			$srv{$key} =	\@list;
+		}
+
+		# Otherwise, put it in %config.
+		else {
+			$config{$key} =	$val;
+		}
+	}
+
+	close PROFILE;
+
+}
+
+# create the server list from the default list and command line
+sub create_server_list() {
+
+	# let's start with a hash.  it's a hell of a lot better than using a list
+	# and having to deal with duplicate entries...
+	%nameservers =		();
+
+	# if default_list is set and not set to the string "none", snag those values
+	# and add them to the nameservers hash
+	if ($config{"default_list"} && $config{"default_list"} ne "none") {
+
+		$list = $srv{$config{'default_list'}};
+
+		unless ($list) {
+			print "The default list, " . $config{"default_list"} . ", is not defined!\n";
+			exit 1;
+		}
+
+		foreach $server (@$list) {
+			$nameservers{$server} = 1;
+		}
+	}
+
+	# go through the command line options, set the hash value to 0 on all the
+	# ones that are minused, and set the hash value to 1 on all the ones that
+	# are plussed
+	#
+	# if this is the option set after the double-dashes, and the first value
+	# has already been pulled off the stack...and we still have an option that
+	# is not a server modification, somebody doesn't understand what we're
+	# doing.
+	while ($serverarg = shift @ARGV) {
+		if ($serverarg =~ s/^\+(.*)/$1/) {
+			$thingtosetitto = 1;
+		}
+		elsif ($serverarg =~ s/^-(.*)/$1/) {
+			$thingtosetitto = "";
+		}
+		else {
+			print_usage();
+		}
+
+
+		if ($srv{$serverarg}) {
+			foreach $server (@{$srv{$serverarg}}) {
+				$nameservers{$server} = $thingtosetitto;
+			}
+		}
+		else {
+			$nameservers{$serverarg} = $thingtosetitto;
+		}
+	}
+
+	# convert our hash to a list.  not as easy as it should be because we
+	# only want the keys w/a value of 1
+	while(($server,$toggle) = each (%nameservers)) {
+		if ($toggle == 1) {
+			push (@nameservers, $server);
+		}
+	}
+}
+
+# parse our command-line arguments
+sub parse_arguments() {
+
+	Getopt::Long::Configure('bundling');
+
+	# i love this
+	GetOptions(
+		'ttl|t!' =>		\$config{"compare_ttl"},
+		'recurse|r!' =>		\$config{"recurse"},
+		'debug|d' =>		\$config{"debug"},
+		'case|c!' =>		\$config{"compare_case"}
+	);
+
+	# really the first value besides options should be the host.  if, by some
+	# chance, it's not, and it's a server list modification..someone doesn't
+	# understand how this thing works.
+
+	$string =		shift @ARGV; chomp $string;
+
+	if (!$string || $string =~ m/^[\+-]/) {
+		print_usage();
+	}
+
+}
+
+# compare two RR sets
+sub comparerrset() {
+
+	my ($set1, $set2) =	@_;
+
+	# if the number of results differ, kick it back immediately
+	unless (scalar @$set1 == scalar @$set2) {
+		return 0;
+	}
+
+	# if we consider that they have the same amount of records in
+	# the resultset, then everything in $rr1 should also be in
+	# $rr2.  first sign of that not being true, kick it back.
+	RR: foreach $rr1 (@$set1) {
+		foreach $rr2 (@$set2) {
+			if (comparerr($rr1, $rr2)) {
+				next RR;
+			}
+		}
+		return 0;
+	}
+	return 1;
+}
+
+# compare two RRs
+sub comparerr() {
+
+	# this assumes that every rr hash contains the same keys
+
+	my ($rr1, $rr2) =	@_;
+
+	foreach $key (keys %$rr1) {
+		unless ($$rr1{$key} eq $$rr2{$key}) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+# convert a RR hash into string format
+sub rrstr() {
+
+	my ($rr) =	@_;
+
+	$return =	$$rr{"auth"} . " ";
+	$return .=	$$rr{"name"} . " ";
+
+	if ($config{"compare_ttl"}) {
+		$return .=	$$rr{"ttl"} . " ";
+	}
+
+	$return .=	$$rr{"class"} . " ";
+	$return .=	$$rr{"type"} . " ";
+	$return .=	$$rr{"data"} . "\n";
+
+	return $return;
+}
+
+# fully qualify a hostname
+sub fullyqualify() {
+
+	my($string) =	@_;
+
+	# if always_fq is set, and the string does not end with a dot and it's
+	# not a dotted quad, tack on the default domain and a trailing dot.
+	if ($config{"always_fq"}) {
+		unless ($$string =~ m/\.$/ ||
+			$$string =~ m/^\d+\.\d+\.\d+\.\d+$/) {
+
+			$$string .= "." . $config{"domain_fq"} . ".";
+		}
+	}
+}
+
+sub print_usage() {
+
+	print <<"EOF";
+	
+usage:	./multidig host [ options ] [ -- +server|serverlist -server|serverlist ]
+
+options:
+
+	--case, -c		Turn case sensitivity on
+	--nocase, -noc		Turn case sensitivity off
+
+	--ttl, -t		Turn ttl comparison on
+	--nottl, -not		Turn ttl comparison off
+
+	--recurse, -r		Turn recursion on
+	--norecurse, -nor	Turk recursion off
+
+EOF
+
+	exit 1;
+
+}
+
